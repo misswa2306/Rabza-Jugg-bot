@@ -13,7 +13,7 @@ class ResolveActionTests(unittest.TestCase):
         self.assertIsNone(result.prison_minutes)
 
     def test_vehicle_failure_sends_player_to_prison(self) -> None:
-        result = resolve_action("steal_trx", roll=0.6)
+        result = resolve_action("steal_lexus", roll=0.6)
         self.assertEqual(result.cash_delta, 0)
         self.assertEqual(result.prison_minutes, 60)
 
@@ -28,6 +28,79 @@ class ResolveActionTests(unittest.TestCase):
     def test_berri_success_threshold_is_80_percent(self) -> None:
         self.assertEqual(resolve_action("berri", roll=0.799).cash_delta, 120)
         self.assertEqual(resolve_action("berri", roll=0.8).prison_minutes, 20)
+
+    def test_level_progression_and_level_cap(self) -> None:
+        from game import level_for_xp, xp_to_next_level
+
+        self.assertEqual(level_for_xp(99), 1)
+        self.assertEqual(level_for_xp(100), 2)
+        self.assertEqual(level_for_xp(299), 2)
+        self.assertEqual(level_for_xp(300), 3)
+        self.assertEqual(level_for_xp(177000), 60)
+        self.assertEqual(level_for_xp(999999), 60)
+        self.assertEqual(xp_to_next_level(300, 3), 300)
+        self.assertEqual(xp_to_next_level(177000, 60), 0)
+
+    def test_action_unlocks_and_obd_gate(self) -> None:
+        from game import actions_available
+
+        level_one = {action for action, _ in actions_available(1, False)}
+        self.assertEqual(level_one, {"berri", "bixi"})
+        level_ten = {action for action, _ in actions_available(10, False)}
+        self.assertTrue({"berri", "bixi", "dep", "marketplace"} <= level_ten)
+        level_twenty_with_obd = {
+            action for action, _ in actions_available(20, True)
+        }
+        self.assertIn("steal_rav4", level_twenty_with_obd)
+        self.assertNotIn("jewelry", level_twenty_with_obd)
+
+    def test_high_tier_equipment_bonus_applies(self) -> None:
+        result = resolve_action("port", roll=0.40, success_bonus=0.15)
+        self.assertTrue(result.success)
+        self.assertEqual(result.xp_gain, 160)
+
+    def test_pvp_success_rate_depends_on_attacker_weapon(self) -> None:
+        from game import resolve_pvp
+
+        unarmed = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=False,
+            attack_roll=0.50,
+            counter_roll=0.99,
+            transfer_roll=0.5,
+        )
+        armed = resolve_pvp(
+            attacker_has_weapon=True,
+            victim_has_weapon=False,
+            attack_roll=0.64,
+            counter_roll=0.99,
+            transfer_roll=0.5,
+        )
+        self.assertEqual(unarmed.outcome, "failed")
+        self.assertEqual(armed.outcome, "success")
+        self.assertEqual(armed.transfer_rate, 0.25)
+
+    def test_victim_weapon_riposte_chance_is_60_percent(self) -> None:
+        from game import resolve_pvp
+
+        counter = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=True,
+            attack_roll=0.1,
+            counter_roll=0.59,
+        )
+        no_counter = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=True,
+            attack_roll=0.1,
+            counter_roll=0.6,
+            transfer_roll=0.9,
+        )
+        self.assertEqual(counter.outcome, "counter")
+        self.assertEqual(counter.prison_minutes, 60)
+        self.assertEqual(counter.fine, 500)
+        self.assertEqual(no_counter.outcome, "success")
+        self.assertAlmostEqual(no_counter.transfer_rate, 0.33)
 
     @patch("game.random.random", return_value=0.59)
     def test_default_roll_uses_random_module(self, random_roll) -> None:

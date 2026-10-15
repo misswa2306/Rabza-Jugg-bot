@@ -38,8 +38,18 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/start` — inscription et accueil
 - `/profil` — cash, gamos, heat et statut
 - `/jugg` — menu des actions du mini-jeu
+- `/shop` — marketplace d'items de jeu, verrouillés par niveau
+- `/inventory` — inventaire et bonus des items
+- `/braquer @username` — défi PVP fictif (niveau 20+)
 - `/top` — classement des dix joueurs les plus riches
 - `/prison` — temps restant et option de caution (300$)
+
+Les niveaux vont de 1 à 60. Le prochain niveau coûte 100 × niveau XP
+(par exemple 100 XP du niveau 1 au 2, puis 200 XP du niveau 2 au 3).
+L'XP est persisté avec les joueurs; la base existante est migrée au lancement.
+Les bonus d'XP des sapes et les bonus de réussite d'équipement sont des valeurs
+de jeu abstraites; le bonus des sapes est le plus élevé parmi les vêtements
+possédés. Le boîtier OBD est requis pour les défis gamos de niveau 20+.
 
 ## Tests
 
