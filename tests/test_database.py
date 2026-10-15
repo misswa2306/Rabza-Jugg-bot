@@ -1,10 +1,14 @@
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiosqlite
+
 from database import Database
+from game import PRISON_DURATION_SECONDS
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -32,9 +36,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player["heat"], 12)
         self.assertEqual(player["gamos"], "RAV4")
 
+    async def test_schema_has_context_scoped_player_and_inventory_keys(self) -> None:
+        connection = sqlite3.connect(self.database.path)
+        try:
+            player_columns = connection.execute(
+                "PRAGMA table_info(players)"
+            ).fetchall()
+            inventory_columns = connection.execute(
+                "PRAGMA table_info(inventory)"
+            ).fetchall()
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
+
+        player_primary_key = [
+            row[1] for row in sorted(player_columns, key=lambda row: row[5]) if row[5]
+        ]
+        inventory_primary_key = [
+            row[1]
+            for row in sorted(inventory_columns, key=lambda row: row[5])
+            if row[5]
+        ]
+        self.assertEqual(player_primary_key, ["chat_id", "user_id"])
+        self.assertEqual(
+            inventory_primary_key, ["chat_id", "user_id", "item_id"]
+        )
+        self.assertTrue({"players", "items", "inventory"} <= tables)
+
     async def test_prison_blocks_actions_and_bail_releases_player(self) -> None:
         await self.database.ensure_player(202, "en_taupe")
-        deadline = datetime.now(timezone.utc) + timedelta(minutes=60)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=PRISON_DURATION_SECONDS)
         applied = await self.database.apply_action_result(
             202, 0, 15, None, deadline
         )
@@ -47,7 +83,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         player = await self.database.get_player(202)
         self.assertEqual(player["cash"], 200)
-        self.assertIsNone(player["in_prison_until"])
+        self.assertEqual(player["in_prison_until"], 0)
 
     async def test_leaderboard_is_ordered_by_cash(self) -> None:
         await self.database.ensure_player(1, "premier")
@@ -70,7 +106,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         effects = await self.database.get_item_effects(303)
         self.assertTrue(effects["has_obd"])
         self.assertTrue(effects["has_weapon"])
-        self.assertEqual(effects["success_bonus"], 0.08)
+        self.assertEqual(effects["success_bonus"], 0.11)
         player = await self.database.get_player(303)
         self.assertEqual(player["cash"], 3000)
 
@@ -81,6 +117,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.database.purchase_item(404, "tech_fleece"), "ok")
         self.assertEqual(await self.database.purchase_item(404, "tech_fleece"), "cash")
         self.assertEqual(await self.database.purchase_item(404, "unknown"), "missing")
+
+    async def test_shop_equipment_bonuses_are_added_for_juggs(self) -> None:
+        await self.database.ensure_player(405, "bonus_items")
+        self.assertEqual(await self.database.purchase_item(405, "tech_fleece"), "ok")
+        self.assertEqual(await self.database.purchase_item(405, "bixi"), "ok")
+
+        effects = await self.database.get_item_effects(405)
+
+        self.assertAlmostEqual(effects["success_bonus"], 0.04)
 
     async def test_pvp_cash_transfer_and_counter_fine(self) -> None:
         await self.database.ensure_player(505, "attaquant")
@@ -102,7 +147,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(boosted["amount"], 112)
         self.assertEqual((await self.database.get_player(606))["cash"], 288)
 
-        jail_until = datetime.now(timezone.utc) + timedelta(minutes=30)
+        jail_until = datetime.now(timezone.utc) + timedelta(seconds=PRISON_DURATION_SECONDS)
         counter = await self.database.apply_pvp_result(
             505, 606, "counter", 100, jail_until, 0
         )
@@ -117,7 +162,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.apply_action_result(
             808, 0, 0, None, None, xp_gain=19000
         )
-        deadline = datetime.now(timezone.utc) + timedelta(minutes=30)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=PRISON_DURATION_SECONDS)
 
         result = await self.database.apply_pvp_result(
             808, 909, "failed", 0, deadline, 0
@@ -127,8 +172,45 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         attacker = await self.database.get_player(808)
         victim = await self.database.get_player(909)
         self.assertEqual(attacker["cash"], 500)
-        self.assertIsNotNone(attacker["in_prison_until"])
+        self.assertGreater(attacker["in_prison_until"], datetime.now(timezone.utc).timestamp())
         self.assertEqual(victim["cash"], 500)
+
+    async def test_action_unlocks_after_jail_deadline_expires(self) -> None:
+        await self.database.ensure_player(1001, "released")
+        expired_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await self.database.apply_action_result(
+            1001, 0, 0, None, expired_deadline
+        )
+
+        applied = await self.database.apply_action_result(
+            1001, 120, 5, None, None
+        )
+
+        self.assertTrue(applied)
+        player = await self.database.get_player(1001)
+        self.assertEqual(player["cash"], 620)
+        self.assertEqual(player["in_prison_until"], 0)
+
+    async def test_get_player_persistently_clears_expired_unix_prison(self) -> None:
+        await self.database.ensure_player(1002, "released_unix")
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                "UPDATE players SET in_prison_until = ? WHERE user_id = ?",
+                (time.time() - 1, 1002),
+            )
+            await connection.commit()
+
+        player = await self.database.get_player(1002)
+        self.assertEqual(player["in_prison_until"], 0)
+        connection = sqlite3.connect(self.database.path)
+        try:
+            persisted_value = connection.execute(
+                "SELECT in_prison_until FROM players WHERE user_id = ?",
+                (1002,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(persisted_value, 0)
 
     async def test_group_players_keep_separate_balances_and_inventories(self) -> None:
         await self.database.ensure_player(1111, "player_one")
@@ -147,6 +229,37 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["item_id"] for item in first_items], ["glock_19"])
         self.assertEqual(second_items, [])
 
+    async def test_same_player_has_isolated_private_and_group_state(self) -> None:
+        user_id = 1212
+        private_chat_id = user_id
+        group_chat_id = -100987
+        await self.database.ensure_player(user_id, "multi_context", private_chat_id)
+        await self.database.ensure_player(user_id, "multi_context", group_chat_id)
+        await self.database.apply_action_result(
+            user_id,
+            4000,
+            0,
+            None,
+            time.time() + PRISON_DURATION_SECONDS,
+            xp_gain=19000,
+            chat_id=group_chat_id,
+        )
+        self.assertEqual(
+            await self.database.purchase_item(user_id, "glock_19", group_chat_id),
+            "ok",
+        )
+
+        private_player = await self.database.get_player(user_id, private_chat_id)
+        group_player = await self.database.get_player(user_id, group_chat_id)
+        private_inventory = await self.database.get_inventory(user_id, private_chat_id)
+        group_inventory = await self.database.get_inventory(user_id, group_chat_id)
+        self.assertEqual(private_player["cash"], 500)
+        self.assertEqual(private_player["in_prison_until"], 0)
+        self.assertEqual(group_player["cash"], 1000)
+        self.assertGreater(group_player["in_prison_until"], time.time())
+        self.assertEqual(private_inventory, [])
+        self.assertEqual([item["item_id"] for item in group_inventory], ["glock_19"])
+
     async def test_initialize_migrates_existing_players_table(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
         connection = sqlite3.connect(legacy_path)
@@ -164,7 +277,36 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE items (
+                    item_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    price INTEGER NOT NULL,
+                    min_level INTEGER NOT NULL,
+                    xp_bonus INTEGER NOT NULL DEFAULT 0,
+                    success_bonus REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE inventory (
+                    user_id INTEGER NOT NULL,
+                    item_id TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (user_id, item_id)
+                )
+                """
+            )
+            connection.execute(
                 "INSERT INTO players (user_id, username) VALUES (707, 'legacy')"
+            )
+            connection.execute(
+                "INSERT INTO items VALUES ('tech_fleece', 'Tech Fleece', 'clothes', 250, 1, 5, 0)"
+            )
+            connection.execute(
+                "INSERT INTO inventory (user_id, item_id) VALUES (707, 'tech_fleece')"
             )
             connection.commit()
         finally:
@@ -172,10 +314,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         migrated = Database(str(legacy_path))
         await migrated.initialize()
-        player = await migrated.get_player(707)
+        player = await migrated.get_player(707, 707)
         self.assertEqual(player["level"], 1)
         self.assertEqual(player["xp"], 0)
-        self.assertEqual(await migrated.purchase_item(707, "tech_fleece"), "ok")
+        self.assertEqual(
+            [item["item_id"] for item in await migrated.get_inventory(707, 707)],
+            ["tech_fleece"],
+        )
 
 
 if __name__ == "__main__":

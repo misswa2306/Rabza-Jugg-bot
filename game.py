@@ -1,12 +1,17 @@
 """Fictional, non-instructional game mechanics and progression catalogue."""
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import math
 import random
+import time
 
 
 MAX_LEVEL = 60
 BAIL_COST = 300
+jail_duration = 45
+PRISON_DURATION_SECONDS = jail_duration
+BASE_SUCCESS_RATE = 0.70
+MAX_SUCCESS_RATE = 0.95
 
 
 @dataclass(frozen=True)
@@ -15,7 +20,7 @@ class GameResult:
     cash_delta: int
     heat_delta: int
     gamos: str | None = None
-    prison_minutes: int | None = None
+    prison_seconds: int | None = None
     xp_gain: int = 0
     success: bool = False
 
@@ -30,8 +35,7 @@ class ActionSpec:
     heat: int
     success_message: str
     failure_message: str
-    prison_minutes: int
-    high_tier: bool = False
+    prison_seconds: int
     gamos: str | None = None
     requires_obd: bool = False
 
@@ -51,27 +55,27 @@ class ShopItem:
 class PvpResult:
     outcome: str
     message: str
-    prison_minutes: int = 0
+    prison_seconds: int = 0
     fine: int = 0
     xp_gain: int = 0
     transfer_rate: float = 0.0
 
 
 ITEMS = (
-    ShopItem("tech_fleece", "Tech Fleece", "sapes", 250, 1, xp_bonus=5),
-    ShopItem("moose_knuckles", "Moose Knuckles", "sapes", 800, 10, xp_bonus=10),
-    ShopItem("trapstar_bag", "Sacoche Trapstar", "sapes", 1500, 20, xp_bonus=15),
-    ShopItem("bixi", "BIXI", "vehicules", 50, 1),
-    ShopItem("lime_scooter", "Scooter Lime", "vehicules", 400, 10),
-    ShopItem("civic_2008", "Civic 2008", "vehicules", 2500, 20),
-    ShopItem("rav4", "RAV4", "vehicules", 15000, 35),
-    ShopItem("urus", "Urus", "vehicules", 120000, 50),
+    ShopItem("tech_fleece", "Tech Fleece", "sapes", 250, 1, xp_bonus=5, success_bonus=0.02),
+    ShopItem("moose_knuckles", "Moose Knuckles", "sapes", 800, 10, xp_bonus=10, success_bonus=0.03),
+    ShopItem("trapstar_bag", "Sacoche Trapstar", "sapes", 1500, 20, xp_bonus=15, success_bonus=0.04),
+    ShopItem("bixi", "BIXI", "vehicules", 50, 1, success_bonus=0.02),
+    ShopItem("lime_scooter", "Scooter Lime", "vehicules", 400, 10, success_bonus=0.03),
+    ShopItem("civic_2008", "Civic 2008", "vehicules", 2500, 20, success_bonus=0.04),
+    ShopItem("rav4", "RAV4", "vehicules", 15000, 35, success_bonus=0.05),
+    ShopItem("urus", "Urus", "vehicules", 120000, 50, success_bonus=0.06),
     ShopItem("tear_gas", "Lacrymo", "armes", 150, 1, success_bonus=0.03),
     ShopItem("glock_19", "Glock 19", "armes", 3500, 20, success_bonus=0.08),
     ShopItem("ak_47", "AK-47", "armes", 12000, 35, success_bonus=0.15),
-    ShopItem("bolt_cutter", "Coupe-boulon", "matos", 100, 1),
-    ShopItem("obd_device", "Boîtier OBD Keyless", "matos", 4000, 20),
-    ShopItem("gps_jammer", "Brouilleur GPS", "matos", 8000, 35),
+    ShopItem("bolt_cutter", "Coupe-boulon", "matos", 100, 1, success_bonus=0.02),
+    ShopItem("obd_device", "Boîtier OBD Keyless", "matos", 4000, 20, success_bonus=0.03),
+    ShopItem("gps_jammer", "Brouilleur GPS", "matos", 8000, 35, success_bonus=0.04),
 )
 
 SHOP_CATEGORIES = {
@@ -84,48 +88,46 @@ SHOP_CATEGORIES = {
 
 ACTION_SPECS = {
     "berri": ActionSpec(
-        "Move fictif à Berri-UQAM", 1, 0.80, 120, 25, 5,
+        "Move fictif à Berri-UQAM", 1, BASE_SUCCESS_RATE, 120, 25, 5,
         "Petit gain de jeu à Berri-UQAM: +{reward}$ et +{xp} XP.",
-        "La chance tourne: 20 minutes à Bordeaux/RDP.", 20,
+        "La chance tourne: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "bixi": ActionSpec(
-        "Défi BIXI", 1, 0.65, 90, 30, 8,
+        "Défi BIXI", 1, BASE_SUCCESS_RATE, 90, 30, 8,
         "Défi BIXI réussi dans le jeu: +{reward}$ et +{xp} XP.",
-        "Le défi BIXI échoue: 15 minutes à Bordeaux/RDP.", 15,
+        "Le défi BIXI échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "dep": ActionSpec(
-        "Défi dép de quartier", 10, 0.60, 220, 45, 12,
+        "Défi dép de quartier", 10, BASE_SUCCESS_RATE, 220, 45, 12,
         "Défi du dép réussi dans le jeu: +{reward}$ et +{xp} XP.",
-        "Le défi dérape: 30 minutes à Bordeaux/RDP.", 30,
+        "Le défi dérape: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "marketplace": ActionSpec(
-        "Défi Marketplace Radisson", 10, 0.75, 250, 50, 8,
+        "Défi Marketplace Radisson", 10, BASE_SUCCESS_RATE, 250, 50, 8,
         "Le deal fictif passe: +{reward}$ et +{xp} XP.",
-        "Le deal échoue: 30 minutes à Bordeaux/RDP.", 30,
+        "Le deal échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "steal_rav4": ActionSpec(
-        "Défi gamos RAV4", 20, 0.60, 350, 75, 12,
+        "Défi gamos RAV4", 20, BASE_SUCCESS_RATE, 350, 75, 12,
         "Défi RAV4 réussi dans le jeu: +{reward}$ et +{xp} XP.",
-        "Le défi échoue: 60 minutes à Bordeaux/RDP.", 60,
-        high_tier=True, gamos="RAV4", requires_obd=True,
+        "Le défi échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
+        gamos="RAV4", requires_obd=True,
     ),
     "steal_lexus": ActionSpec(
-        "Défi gamos Lexus", 20, 0.52, 500, 85, 15,
+        "Défi gamos Lexus", 20, BASE_SUCCESS_RATE, 500, 85, 15,
         "Défi Lexus réussi dans le jeu: +{reward}$ et +{xp} XP.",
-        "Le défi échoue: 60 minutes à Bordeaux/RDP.", 60,
-        high_tier=True, gamos="Lexus", requires_obd=True,
+        "Le défi échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
+        gamos="Lexus", requires_obd=True,
     ),
     "jewelry": ActionSpec(
-        "Défi Plaza St-Hubert", 35, 0.40, 1200, 120, 25,
+        "Défi Plaza St-Hubert", 35, BASE_SUCCESS_RATE, 1200, 120, 25,
         "Défi d'arcade Plaza réussi: +{reward}$ et +{xp} XP.",
-        "Défi raté: 60 minutes à Bordeaux/RDP.", 60,
-        high_tier=True,
+        "Défi raté: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "port": ActionSpec(
-        "Défi conteneur du Port", 50, 0.30, 2500, 160, 35,
+        "Défi conteneur du Port", 50, BASE_SUCCESS_RATE, 2500, 160, 35,
         "Défi d'arcade du Port réussi: +{reward}$ et +{xp} XP.",
-        "Défi raté: 60 minutes à Bordeaux/RDP.", 60,
-        high_tier=True,
+        "Défi raté: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
 }
 
@@ -175,9 +177,11 @@ def resolve_action(
     chance = random.random() if roll is None else roll
     if not 0 <= chance < 1:
         raise ValueError("roll doit être compris entre 0 inclus et 1 exclu")
+    if not math.isfinite(success_bonus) or success_bonus < 0:
+        raise ValueError("success_bonus doit être positif ou nul")
 
-    threshold = min(0.95, spec.success_chance + (success_bonus if spec.high_tier else 0))
-    if chance < threshold:
+    success_rate = min(MAX_SUCCESS_RATE, BASE_SUCCESS_RATE + success_bonus)
+    if chance < success_rate:
         return GameResult(
             spec.success_message.format(reward=spec.reward, xp=spec.xp),
             spec.reward,
@@ -190,7 +194,7 @@ def resolve_action(
         spec.failure_message,
         0,
         spec.heat,
-        prison_minutes=spec.prison_minutes,
+        prison_seconds=spec.prison_seconds,
     )
 
 
@@ -212,8 +216,8 @@ def resolve_pvp(
         return PvpResult(
             "counter",
             "Riposte fictive réussie: la victime bloque le braquage. "
-            "Le braqueur prend 1 heure à Bordeaux et une amende de 500$ versée à la victime.",
-            prison_minutes=60,
+            "Le braqueur prend 45 secondes à Bordeaux et une amende de 500$ versée à la victime.",
+            prison_seconds=PRISON_DURATION_SECONDS,
             fine=500,
         )
     success_chance = 0.50 + (0.15 if attacker_has_weapon else 0.0)
@@ -228,9 +232,14 @@ def resolve_pvp(
         "failed",
         "Le braquage fictif échoue; les condés interviennent. "
         "Aucun cash n'est transféré.",
-        prison_minutes=30,
+        prison_seconds=PRISON_DURATION_SECONDS,
     )
 
 
-def prison_deadline(minutes: int) -> datetime:
-    return datetime.now(timezone.utc) + timedelta(minutes=minutes)
+def prison_deadline(seconds: int = PRISON_DURATION_SECONDS) -> float:
+    """Return the Unix timestamp at which the 45-second jail period expires."""
+    if seconds != PRISON_DURATION_SECONDS:
+        raise ValueError(
+            f"La durée de prison est fixée à {PRISON_DURATION_SECONDS} secondes"
+        )
+    return time.time() + jail_duration

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+import time
 from typing import cast
 
 from telegram import (
@@ -30,6 +31,7 @@ from game import (
     BAIL_COST,
     ITEMS,
     MAX_LEVEL,
+    PRISON_DURATION_SECONDS,
     SHOP_CATEGORIES,
     actions_available,
     item_by_id,
@@ -75,7 +77,7 @@ async def player_context(
     if user is None or chat is None or message is None or user.is_bot:
         return None
 
-    await database_for(context).ensure_player(user.id, user.username)
+    await database_for(context).ensure_player(user.id, user.username, chat.id)
     return user, chat, message
 
 
@@ -97,6 +99,28 @@ def owned_callback_payload(
     return parts[2] if owner_id == user_id else None
 
 
+def prison_remaining_seconds(player: dict[str, object]) -> int:
+    """Return the remaining whole seconds until the Unix jail deadline."""
+    end_time = player.get("in_prison_until")
+    if not end_time:
+        return 0
+    if isinstance(end_time, str):
+        try:
+            end_time = float(end_time)
+        except ValueError:
+            legacy_datetime = datetime.fromisoformat(end_time)
+            if legacy_datetime.tzinfo is None:
+                legacy_datetime = legacy_datetime.replace(tzinfo=timezone.utc)
+            end_time = legacy_datetime.timestamp()
+    elif isinstance(end_time, datetime):
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        end_time = end_time.timestamp()
+    if not isinstance(end_time, (int, float)):
+        raise TypeError("in_prison_until doit être un timestamp Unix")
+    return max(0, int(end_time - time.time()))
+
+
 async def post_init(application: Application) -> None:
     database = Database(DATABASE_PATH)
     await database.initialize()
@@ -107,7 +131,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    message = actor[2]
     await message.reply_text(
         "Wesh l'équipe, bienvenue sur le Rabza Jugg Bot! "
         "Montréal t'attend: gamos, kichta et décisions douteuses — "
@@ -120,25 +144,19 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    user, chat, message = actor
     database = database_for(context)
-    player = await database.get_player(user.id)
+    player = await database.get_player(user.id, chat.id)
     if player is None:
         raise RuntimeError(
             f"Le joueur {user.id} est introuvable après son enregistrement."
         )
 
-    prison_until = player["in_prison_until"]
-    if prison_until:
-        until = datetime.fromisoformat(prison_until)
-        if until.tzinfo is None:
-            until = until.replace(tzinfo=timezone.utc)
-        remaining = until - datetime.now(timezone.utc)
-        if remaining.total_seconds() > 0:
-            minutes = max(1, int((remaining.total_seconds() + 59) // 60))
-            status = f"En taule à Bordeaux/RDP — encore {minutes} min"
-        else:
-            status = "Libre (ta peine est finie, c'est carré)"
+    remaining_seconds = prison_remaining_seconds(player)
+    if remaining_seconds:
+        status = f"En taule à Bordeaux/RDP — encore {remaining_seconds} s"
+    elif player["in_prison_until"]:
+        status = "Libre (ta peine est finie, c'est carré)"
     else:
         status = "Libre"
 
@@ -158,13 +176,20 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    user, chat, message = actor
 
     database = database_for(context)
-    player = await database.get_player(user.id)
-    effects = await database.get_item_effects(user.id)
+    player = await database.get_player(user.id, chat.id)
+    effects = await database.get_item_effects(user.id, chat.id)
     if player is None:
         raise RuntimeError(f"Le joueur {user.id} est introuvable après son enregistrement.")
+    jail_seconds = prison_remaining_seconds(player)
+    if jail_seconds:
+        await message.reply_text(
+            f"T'es encore à Bordeaux/RDP pour {jail_seconds} seconde(s). "
+            "Réessaie quand le compteur tombe à zéro."
+        )
+        return
     available = actions_available(player["level"], bool(effects["has_obd"]))
     keyboard = [
         [
@@ -212,7 +237,7 @@ async def handle_game_action(
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, _message = actor
+    user, chat = actor[0], actor[1]
 
     allowed_actions = set(ACTION_SPECS)
     if action not in allowed_actions:
@@ -220,11 +245,19 @@ async def handle_game_action(
         return
 
     database = database_for(context)
-    player = await database.get_player(user.id)
-    effects = await database.get_item_effects(user.id)
+    player = await database.get_player(user.id, chat.id)
+    effects = await database.get_item_effects(user.id, chat.id)
     if player is None:
         raise RuntimeError(f"Le joueur {user.id} est introuvable.")
     spec = ACTION_SPECS[action]
+    jail_seconds = prison_remaining_seconds(player)
+    if jail_seconds:
+        await edit_callback_message(
+            query,
+            f"T'es encore à Bordeaux/RDP pour {jail_seconds} seconde(s). "
+            "Réessaie quand le compteur tombe à zéro.",
+        )
+        return
     if player["level"] < spec.min_level:
         await edit_callback_message(
             query,
@@ -254,8 +287,8 @@ async def handle_game_action(
         else 0
     )
     prison_until = (
-        prison_deadline(result.prison_minutes)
-        if result.prison_minutes is not None
+        prison_deadline(result.prison_seconds)
+        if result.prison_seconds is not None
         else None
     )
     applied = await database.apply_action_result(
@@ -265,6 +298,7 @@ async def handle_game_action(
         result.gamos,
         prison_until,
         xp_gain,
+        chat_id=chat.id,
     )
     if not applied:
         await edit_callback_message(
@@ -285,7 +319,7 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    _user, _chat, message = actor
+    user, message = actor[0], actor[2]
     keyboard = [
         [
             InlineKeyboardButton(
@@ -319,7 +353,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, _message = actor
+    user, chat = actor[0], actor[1]
     database = database_for(context)
 
     if data.startswith("shop:") and payload != "home":
@@ -327,7 +361,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if category not in SHOP_CATEGORIES:
             await edit_callback_message(query, "Cette catégorie n'existe pas.")
             return
-        player = await database.get_player(user.id)
+        player = await database.get_player(user.id, chat.id)
         if player is None:
             raise RuntimeError(f"Le joueur {user.id} est introuvable.")
         category_items = [item for item in ITEMS if item.category == category]
@@ -373,9 +407,9 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if item is None:
             await edit_callback_message(query, "Cet item n'existe pas.")
             return
-        outcome = await database.purchase_item(user.id, item_id)
+        outcome = await database.purchase_item(user.id, item_id, chat.id)
         if outcome == "ok":
-            player = await database.get_player(user.id)
+            player = await database.get_player(user.id, chat.id)
             text = (
                 f"✅ {item.name} ajouté à ton inventaire! "
                 f"Kob restant: {player['cash']}$."
@@ -415,9 +449,9 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    user, chat, message = actor
     database = database_for(context)
-    items = await database.get_inventory(user.id)
+    items = await database.get_inventory(user.id, chat.id)
     if not items:
         await message.reply_text("Ton inventaire est vide. Fais /shop pour magasiner.")
         return
@@ -432,7 +466,7 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"\n{SHOP_CATEGORIES.get(category, category.title())}:")
         lines.extend(entries)
 
-    effects = await database.get_item_effects(user.id)
+    effects = await database.get_item_effects(user.id, chat.id)
     lines.append(f"\nBonus XP max des sapes: +{effects['xp_bonus']}%")
     lines.append(f"Bonus de réussite abstrait: +{effects['success_bonus']:.0%}")
     lines.append(
@@ -446,11 +480,23 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    user, chat, message = actor
+    if chat.type not in {"group", "supergroup"}:
+        await message.reply_text(
+            "❌ Les braquages entre joueurs se font uniquement dans les groupes !"
+        )
+        return
     database = database_for(context)
-    attacker = await database.get_player(user.id)
+    attacker = await database.get_player(user.id, chat.id)
     if attacker is None:
         raise RuntimeError(f"Le joueur {user.id} est introuvable.")
+    jail_seconds = prison_remaining_seconds(attacker)
+    if jail_seconds:
+        await message.reply_text(
+            f"T'es encore à Bordeaux pour {jail_seconds} seconde(s). "
+            "Le défi PVP sera dispo quand ta peine sera finie."
+        )
+        return
     if attacker["level"] < 20:
         await message.reply_text("Le défi PVP est verrouillé jusqu'au niveau 20.")
         return
@@ -458,7 +504,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Usage: /braquer @username (défi fictif entre joueurs)")
         return
 
-    victim = await database.get_player_by_username(context.args[0])
+    victim = await database.get_player_by_username(context.args[0], chat.id)
     if victim is None:
         await message.reply_text(
             "Joueur introuvable. Il doit avoir lancé /start et avoir un username Telegram."
@@ -468,15 +514,15 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Tu peux pas lancer un défi contre toi-même.")
         return
 
-    attacker_effects = await database.get_item_effects(user.id)
-    victim_effects = await database.get_item_effects(victim["user_id"])
+    attacker_effects = await database.get_item_effects(user.id, chat.id)
+    victim_effects = await database.get_item_effects(victim["user_id"], chat.id)
     result = resolve_pvp(
         attacker_has_weapon=bool(attacker_effects["has_weapon"]),
         victim_has_weapon=bool(victim_effects["has_weapon"]),
     )
     deadline = (
-        prison_deadline(result.prison_minutes)
-        if result.prison_minutes
+        prison_deadline(result.prison_seconds)
+        if result.prison_seconds
         else None
     )
     applied = await database.apply_pvp_result(
@@ -487,6 +533,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         deadline,
         result.xp_gain,
         result.transfer_rate,
+        chat_id=chat.id,
     )
     if applied is None:
         await message.reply_text("Défi PVP impossible: cible invalide.")
@@ -498,7 +545,8 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(
             f"💥 Riposte de jeu! @{victim['username']} bloque le braquage avec "
             f"son équipement ({victim_effects['weapon_name']}). "
-            f"Tu prends 1h à Bordeaux et verses {applied['fine']}$ à "
+            f"Tu prends {PRISON_DURATION_SECONDS} secondes à Bordeaux et verses "
+            f"{applied['fine']}$ à "
             f"@{victim['username']}."
         )
     elif applied["status"] == "success":
@@ -509,16 +557,17 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await message.reply_text(
-            f"{result.message} Direction Bordeaux pour 30 minutes. "
+            f"{result.message} Direction Bordeaux pour {PRISON_DURATION_SECONDS} secondes. "
             "Aucun cash n'a changé de mains."
         )
 
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
+    actor = await player_context(update, context)
+    if actor is None:
         return
-    players = await database_for(context).get_top_players()
+    chat, message = actor[1], actor[2]
+    players = await database_for(context).get_top_players(chat_id=chat.id)
     if not players:
         await message.reply_text("Y'a personne dans le classement pour l'instant.")
         return
@@ -534,29 +583,25 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, message = actor
+    user, chat, message = actor
     database = database_for(context)
-    player = await database.get_player(user.id)
+    player = await database.get_player(user.id, chat.id)
     if player is None:
         raise RuntimeError(
             f"Le joueur {user.id} est introuvable après son enregistrement."
         )
     prison_until = player["in_prison_until"]
+    remaining_seconds = prison_remaining_seconds(player)
     if not prison_until:
         await message.reply_text("T'es libre, chef. Pas de cellule pour toi, c'est carré.")
         return
 
-    until = datetime.fromisoformat(prison_until)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=timezone.utc)
-    remaining = until - datetime.now(timezone.utc)
-    if remaining.total_seconds() <= 0:
+    if remaining_seconds <= 0:
         await message.reply_text(
             "Ta peine est finie, t'es libre! Retour dans les rues de Montréal."
         )
         return
 
-    minutes = max(1, int((remaining.total_seconds() + 59) // 60))
     keyboard = [
         [
             InlineKeyboardButton(
@@ -566,7 +611,7 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ]
     ]
     await message.reply_text(
-        f"T'es encore à Bordeaux/RDP pour environ {minutes} min. "
+        f"T'es encore à Bordeaux/RDP pour {remaining_seconds} seconde(s). "
         f"T'as {player['cash']}$; la caution coûte {BAIL_COST}$. "
         "La patience ou la kichta, à toi de voir.",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -584,8 +629,10 @@ async def pay_bail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, _chat, _message = actor
-    released = await database_for(context).pay_bail(user.id, BAIL_COST)
+    user, chat = actor[0], actor[1]
+    released = await database_for(context).pay_bail(
+        user.id, BAIL_COST, chat.id
+    )
     if released:
         await edit_callback_message(
             query,

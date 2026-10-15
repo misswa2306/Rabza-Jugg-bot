@@ -2,11 +2,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telegram.error import BadRequest
 
-from bot import edit_callback_message, player_context
+from bot import (
+    braquer,
+    edit_callback_message,
+    handle_game_action,
+    player_context,
+    prison_remaining_seconds,
+)
+from config import validate_config
 from database import Database
 
 
@@ -65,8 +72,8 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first[0].id, 101)
             self.assertEqual(second[0].id, 202)
             self.assertEqual(first[1].id, second[1].id)
-            first_player = await database.get_player(first[0].id)
-            second_player = await database.get_player(second[0].id)
+            first_player = await database.get_player(first[0].id, chat.id)
+            second_player = await database.get_player(second[0].id, chat.id)
             self.assertEqual(first_player["user_id"], 101)
             self.assertEqual(second_player["user_id"], 202)
             self.assertNotEqual(first_player["user_id"], second_player["user_id"])
@@ -93,6 +100,127 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(missing_chat)
         self.assertIsNone(bot_user)
+
+
+class PrisonTimerTests(unittest.TestCase):
+    def test_remaining_time_counts_down_and_expires(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        self.assertEqual(prison_remaining_seconds({"in_prison_until": None}), 0)
+        future = datetime.now(timezone.utc) + timedelta(seconds=44)
+        remaining = prison_remaining_seconds(
+            {"in_prison_until": future.isoformat()}
+        )
+        self.assertGreaterEqual(remaining, 1)
+        self.assertLessEqual(remaining, 44)
+
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.assertEqual(
+            prison_remaining_seconds({"in_prison_until": past.isoformat()}), 0
+        )
+
+    def test_unix_deadline_reports_exactly_45_seconds(self) -> None:
+        with patch("bot.time.time", return_value=1_700_000_000):
+            self.assertEqual(
+                prison_remaining_seconds(
+                    {"in_prison_until": 1_700_000_045}
+                ),
+                45,
+            )
+
+
+class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
+    async def _invoke_braquer(self, chat_type: str) -> tuple[AsyncMock, AsyncMock]:
+        database = AsyncMock()
+        database.get_player.return_value = {
+            "user_id": 101,
+            "username": "joueur",
+            "level": 1,
+            "in_prison_until": 0,
+        }
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=["@cible"],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type=chat_type),
+            effective_message=message,
+        )
+
+        await braquer(update, context)
+        return database, message.reply_text
+
+    async def test_braquer_is_rejected_in_private_chat(self) -> None:
+        database, reply_text = await self._invoke_braquer("private")
+        reply_text.assert_awaited_once_with(
+            "❌ Les braquages entre joueurs se font uniquement dans les groupes !"
+        )
+        database.get_player.assert_not_awaited()
+
+    async def test_braquer_is_allowed_to_reach_game_rules_in_groups(self) -> None:
+        for chat_type in ("group", "supergroup"):
+            with self.subTest(chat_type=chat_type):
+                database, reply_text = await self._invoke_braquer(chat_type)
+                database.get_player.assert_awaited_once_with(101, -1001)
+                reply_text.assert_awaited_once_with(
+                    "Le défi PVP est verrouillé jusqu'au niveau 20."
+                )
+
+
+class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_callback_passes_equipment_bonus_to_random_resolver(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {
+            "user_id": 303,
+            "username": "jugg_player",
+            "level": 1,
+            "in_prison_until": 0,
+        }
+        database.get_item_effects.return_value = {
+            "has_obd": False,
+            "success_bonus": 0.05,
+            "xp_bonus": 0,
+        }
+        database.apply_action_result.return_value = True
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="game:303:bixi")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=303, username="jugg_player", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-100303, type="supergroup"),
+            effective_message=object(),
+        )
+
+        with (
+            patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch("game.random.random", return_value=0.71),
+        ):
+            await handle_game_action(update, context)
+
+        sleep.assert_awaited_once_with(2)
+        query.answer.assert_awaited_once()
+        database.get_item_effects.assert_awaited_once_with(303, -100303)
+        database.apply_action_result.assert_awaited_once_with(
+            303, 90, 8, None, None, 30, chat_id=-100303
+        )
+        self.assertIn("réussi", query.edit_message_text.await_args.args[0])
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_missing_botfather_token_fails_with_clear_configuration_error(self) -> None:
+        with patch("config.BOT_TOKEN", ""):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BOT_TOKEN est absente"
+            ):
+                validate_config()
 
 
 if __name__ == "__main__":
