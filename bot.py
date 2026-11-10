@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import time
 from typing import TypedDict, cast
 
@@ -53,6 +54,53 @@ class ActorInfo(TypedDict):
     id: int
     name: str
     username: str | None
+
+
+@dataclass(frozen=True)
+class MissionSpec:
+    mission_id: str
+    name: str
+    min_level: int
+    reward: int
+    xp: int
+    success_chance: float
+
+
+MISSIONS = (
+    MissionSpec("civic", "Vol de civic rouillée dans une ruelle", 1, 100, 20, 0.85),
+    MissionSpec(
+        "audi",
+        "Carjacking d'une Audi sur Sainte-Catherine",
+        3,
+        350,
+        50,
+        0.70,
+    ),
+    MissionSpec(
+        "entrepot",
+        "Pillage d'un entrepôt de pièces au port de Montréal",
+        5,
+        900,
+        120,
+        0.55,
+    ),
+    MissionSpec(
+        "blindee",
+        "Braquage d'un transport de fonds blindé",
+        7,
+        2500,
+        250,
+        0.40,
+    ),
+    MissionSpec(
+        "helico",
+        "Vol masterclass d'un hélico survolant le centre-ville",
+        10,
+        7500,
+        600,
+        0.25,
+    ),
+)
 
 
 ROULETTE_RED_NUMBERS = frozenset(
@@ -207,6 +255,21 @@ def deal_blackjack() -> tuple[list[str], list[str]]:
     while blackjack_hand_value(dealer_hand) < 17:
         dealer_hand.append(deck.pop())
     return player_hand, dealer_hand
+
+
+def find_mission(query: str) -> MissionSpec | None:
+    normalized_query = query.casefold().strip()
+    return next(
+        (
+            mission
+            for mission in MISSIONS
+            if normalized_query in {
+                mission.mission_id,
+                mission.name.casefold(),
+            }
+        ),
+        None,
+    )
 
 
 async def post_init(application: Application) -> None:
@@ -711,6 +774,129 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    actor = await player_context(update, context)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    database = database_for(context)
+    args = context.args
+
+    if not args:
+        player = await database.get_player(actor_info["id"], chat.id)
+        if player is None:
+            raise RuntimeError(
+                f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
+            )
+        lines = [
+            "🚘 Missions d'arcade — tout est fictif\n",
+            f"Ton niveau: {player['level']}. Choisis une mission avec "
+            "/mission <id>.",
+        ]
+        lines.extend(
+            f"\n{'✅ Disponible' if player['level'] >= mission.min_level else '🔒 Verrouillée'}"
+            f" — niv. {mission.min_level} — {mission.name} "
+            f"({mission.mission_id})\n"
+            f"Réussite: {mission.success_chance:.0%} | "
+            f"Gain: {mission.reward}$ | XP: {mission.xp}"
+            for mission in MISSIONS
+        )
+        await message.reply_text("\n".join(lines))
+        return
+
+    mission = find_mission(" ".join(args))
+    if mission is None:
+        await message.reply_text(
+            "Mission inconnue. Utilise /missions pour voir les missions et leurs IDs."
+        )
+        return
+
+    player = await database.get_player(actor_info["id"], chat.id)
+    if player is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
+        )
+    jail_seconds = prison_remaining_seconds(player)
+    if jail_seconds:
+        await message.reply_text(
+            f"{actor_info['name']}, tu es encore en taule pour "
+            f"{jail_seconds} seconde(s)."
+        )
+        return
+    if player["level"] < mission.min_level:
+        await message.reply_text(
+            f"Mission verrouillée: niveau {mission.min_level} requis. "
+            f"Tu es niveau {player['level']}."
+        )
+        return
+
+    succeeded = random.random() < mission.success_chance
+    if succeeded:
+        applied = await database.apply_action_result(
+            actor_info["id"],
+            mission.reward,
+            0,
+            None,
+            None,
+            xp_gain=mission.xp,
+            chat_id=chat.id,
+        )
+    else:
+        fine_limit = min(250, int(player["cash"]))
+        fine = random.randint(1, fine_limit) if fine_limit else 0
+        jailed = random.random() < 0.20
+        applied = await database.apply_action_result(
+            actor_info["id"],
+            -fine,
+            0,
+            None,
+            prison_deadline(PRISON_DURATION_SECONDS) if jailed else None,
+            chat_id=chat.id,
+        )
+
+    if not applied:
+        latest_player = await database.get_player(actor_info["id"], chat.id)
+        if latest_player is None:
+            raise RuntimeError(
+                f"Le joueur {actor_info['id']} a disparu pendant la mission."
+            )
+        await message.reply_text(
+            f"{actor_info['name']}, la mission n'a pas démarré: tu es "
+            f"maintenant en taule pour "
+            f"{prison_remaining_seconds(latest_player)} seconde(s)."
+        )
+        return
+
+    updated_player = await database.get_player(actor_info["id"], chat.id)
+    if updated_player is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après la mission."
+        )
+    if succeeded:
+        await message.reply_text(
+            f"🏁💨 Mission réussie, {actor_info['name']}!\n"
+            f"🚘 {mission.name}\n"
+            f"💵 +{mission.reward}$ | ✨ +{mission.xp} XP\n"
+            f"⭐ Niveau: {updated_player['level']} | "
+            f"Solde: {updated_player['cash']}$"
+        )
+        return
+
+    if jailed:
+        penalty = (
+            f"🚔 Tu prends {PRISON_DURATION_SECONDS} secondes de taule "
+            "dans le jeu."
+        )
+    else:
+        penalty = "Tu as réussi à filer, sans taule."
+    await message.reply_text(
+        f"🚨 Mission échouée, {actor_info['name']}.\n"
+        f"🚘 {mission.name}\n"
+        f"💸 Amende: -{fine}$ | {penalty}\n"
+        f"Solde: {updated_player['cash']}$"
+    )
+
+
 async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
@@ -924,6 +1110,8 @@ def main() -> None:
     application.add_handler(CommandHandler("braquer", braquer))
     application.add_handler(CommandHandler("top", top))
     application.add_handler(CommandHandler("prison", prison))
+    application.add_handler(CommandHandler("missions", missions))
+    application.add_handler(CommandHandler("mission", missions))
     application.add_handler(CommandHandler("casino", casino))
     application.add_handler(
         CallbackQueryHandler(

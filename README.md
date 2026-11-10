@@ -50,7 +50,12 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/braquer @username` — défi PVP fictif (niveau 20+)
 - `/top` — classement des dix joueurs les plus riches du contexte courant
 - `/prison` — temps restant et option de caution (300$)
+- `/missions` ou `/mission` — catalogue de missions fictives et récompenses
 - `/casino` — menu du casino fictif (blackjack et roulette)
+
+Les missions se lancent avec un identifiant, par exemple `/mission civic`.
+Elles sont débloquées par niveau, accordent du cash et de l'XP en cas de
+réussite, et peuvent entraîner une amende ou une peine de jeu en cas d'échec.
 
 Exemples: `/casino blackjack 500`, `/casino roulette rouge 100` ou
 `/casino roulette 17 20`. Une mise doit être un entier positif et ne peut pas

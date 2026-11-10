@@ -13,6 +13,7 @@ from bot import (
     edit_callback_message,
     handle_game_action,
     player_context,
+    missions,
     profil,
     prison_remaining_seconds,
 )
@@ -292,6 +293,89 @@ class CasinoTests(unittest.IsolatedAsyncioTestCase):
         await casino(update, context)
         self.assertIn("Choix invalide", message.reply_text.await_args.args[0])
         self.assertEqual(await database.get_player_balance(55, chat_id), 500)
+
+
+class MissionTests(unittest.IsolatedAsyncioTestCase):
+    async def _setup_mission(self, args: list[str]):
+        temp_dir = TemporaryDirectory()
+        database = Database(str(Path(temp_dir.name) / "missions.sqlite3"))
+        await database.initialize()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=args,
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        chat = SimpleNamespace(id=-100777, type="supergroup")
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=777,
+                username="mission_player",
+                full_name="Mission Player",
+                is_bot=False,
+            ),
+            effective_chat=chat,
+            effective_message=message,
+        )
+        return temp_dir, database, context, update, message, chat
+
+    async def test_mission_list_displays_all_missions_and_rewards(self) -> None:
+        temp_dir, _, context, update, message, _ = await self._setup_mission([])
+        self.addCleanup(temp_dir.cleanup)
+
+        await missions(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("Vol de civic rouillée", text)
+        self.assertIn("Carjacking d'une Audi", text)
+        self.assertIn("niv. 10", text)
+        self.assertIn("🔒 Verrouillée", text)
+        self.assertIn("✅ Disponible", text)
+        self.assertIn("Réussite: 25% | Gain: 7500$ | XP: 600", text)
+
+    async def test_successful_mission_updates_cash_and_xp(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_mission(
+            ["civic"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        with patch("bot.random.random", return_value=0.0):
+            await missions(update, context)
+
+        player = await database.get_player(777, chat.id)
+        self.assertEqual(player["cash"], 600)
+        self.assertEqual(player["xp"], 20)
+        self.assertEqual(player["level"], 1)
+        self.assertIn("Mission réussie", message.reply_text.await_args.args[0])
+
+    async def test_locked_mission_does_not_change_player_balance(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_mission(
+            ["audi"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        await missions(update, context)
+
+        player = await database.get_player(777, chat.id)
+        self.assertEqual(player["cash"], 500)
+        self.assertIn("niveau 3 requis", message.reply_text.await_args.args[0])
+
+    async def test_failed_mission_can_apply_fine_and_prison(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_mission(
+            ["civic"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        with (
+            patch("bot.random.random", side_effect=[0.99, 0.0]),
+            patch("bot.random.randint", return_value=50),
+        ):
+            await missions(update, context)
+
+        player = await database.get_player(777, chat.id)
+        self.assertEqual(player["cash"], 450)
+        self.assertGreater(player["in_prison_until"], 0)
+        self.assertIn("Mission échouée", message.reply_text.await_args.args[0])
+        self.assertIn("Amende: -50$", message.reply_text.await_args.args[0])
 
 
 class BlackjackHandTests(unittest.TestCase):
