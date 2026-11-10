@@ -1,16 +1,20 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from telegram import Bot, Update, User
 from telegram.error import BadRequest
+from telegram.ext import CommandHandler
 
 from bot import (
     blackjack_hand_value,
     braquer,
     casino,
     edit_callback_message,
+    help_command,
     handle_game_action,
     player_context,
     missions,
@@ -19,6 +23,86 @@ from bot import (
 )
 from config import validate_config
 from database import Database
+
+
+class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_help_lists_all_registered_command_families(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        await help_command(SimpleNamespace(effective_message=message), None)
+
+        text = message.reply_text.await_args.args[0]
+        for command in (
+            "/start",
+            "/profil",
+            "/casino",
+            "/missions",
+            "/mission",
+            "/help",
+            "/jugg",
+            "/braquer",
+            "/shop",
+            "/prison",
+            "/inventory",
+            "/top",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, text)
+
+    def test_command_handlers_accept_plain_and_bot_mentioned_commands(self) -> None:
+        bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+        bot._bot_user = User(
+            id=123456,
+            is_bot=True,
+            first_name="Rabza",
+            username="rabza_destroy_bot",
+        )
+        command_handlers = [
+            CommandHandler(command, help_command)
+            for command in (
+                "start",
+                "profil",
+                "casino",
+                "missions",
+                "mission",
+                "help",
+                "jugg",
+                "braquer",
+                "shop",
+                "prison",
+                "inventory",
+                "top",
+            )
+        ]
+
+        for command_handler in command_handlers:
+            for mention in ("", "@rabza_destroy_bot"):
+                with self.subTest(command=command_handler.commands, mention=mention):
+                    text = f"/{next(iter(command_handler.commands))}{mention}"
+                    update = Update.de_json(
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 1,
+                                "date": int(datetime.now(timezone.utc).timestamp()),
+                                "chat": {
+                                    "id": -100123456789,
+                                    "type": "supergroup",
+                                    "title": "Groupe test",
+                                },
+                                "text": text,
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len(text),
+                                    }
+                                ],
+                            },
+                        },
+                        bot,
+                    )
+
+                    self.assertIsNotNone(command_handler.check_update(update))
 
 
 class EditCallbackMessageTests(unittest.IsolatedAsyncioTestCase):

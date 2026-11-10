@@ -3,8 +3,8 @@
 import asyncio
 import logging
 import random
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import time
 from typing import TypedDict, cast
 
@@ -288,6 +288,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Montréal t'attend: gamos, kichta et décisions douteuses — "
         "tout ça dans un jeu fictif, c'est carré. T'as 500$ pour commencer.\n\n"
         "Tape /profil pour checker ton statut ou /jugg pour choisir ton move."
+    )
+
+
+async def help_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "🎮 Rabza Jugg Bot — commandes disponibles\n\n"
+        "👤 Profil et progression\n"
+        "/start — démarrer le bot\n"
+        "/profil — consulter cash, niveau, XP et statut\n"
+        "/top — classement du groupe\n"
+        "/prison — consulter sa peine et payer la caution\n\n"
+        "🎯 Jeux d'arcade\n"
+        "/jugg — choisir un défi d'arcade\n"
+        "/missions — afficher les missions et les niveaux requis\n"
+        "/mission <id> — lancer une mission (ex. /mission civic)\n"
+        "/casino — afficher les règles et les jeux\n"
+        "/casino blackjack <mise> — jouer au blackjack\n"
+        "/casino roulette <choix> <mise> — jouer à la roulette\n\n"
+        "🛍️ Autres commandes\n"
+        "/shop — parcourir la boutique\n"
+        "/inventory — consulter son inventaire\n"
+        "/braquer @username — défi PVP fictif (niveau 20+)\n\n"
+        "Dans un groupe, tu peux aussi mentionner le bot, par exemple "
+        "/casino@rabza_destroy_bot ou /help@rabza_destroy_bot."
     )
 
 
@@ -1102,6 +1131,7 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("profil", profil))
     application.add_handler(CommandHandler("jugg", jugg))

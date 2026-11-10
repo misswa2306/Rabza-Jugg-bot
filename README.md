@@ -42,6 +42,7 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 
 ## Commandes
 
+- `/help` — liste des commandes disponibles
 - `/start` — inscription et accueil
 - `/profil` — cash, gamos, heat et statut
 - `/jugg` — menu des actions du mini-jeu
@@ -52,6 +53,9 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/prison` — temps restant et option de caution (300$)
 - `/missions` ou `/mission` — catalogue de missions fictives et récompenses
 - `/casino` — menu du casino fictif (blackjack et roulette)
+
+Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
+`/help@rabza_destroy_bot` et `/casino@rabza_destroy_bot`.
 
 Les missions se lancent avec un identifiant, par exemple `/mission civic`.
 Elles sont débloquées par niveau, accordent du cash et de l'XP en cas de
