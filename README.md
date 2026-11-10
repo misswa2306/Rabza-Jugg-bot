@@ -50,6 +50,14 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/braquer @username` — défi PVP fictif (niveau 20+)
 - `/top` — classement des dix joueurs les plus riches du contexte courant
 - `/prison` — temps restant et option de caution (300$)
+- `/casino` — menu du casino fictif (blackjack et roulette)
+
+Exemples: `/casino blackjack 500`, `/casino roulette rouge 100` ou
+`/casino roulette 17 20`. Une mise doit être un entier positif et ne peut pas
+dépasser le solde. Les gains sont nets et la mise est rendue en cas de victoire:
+la roulette paie 1× sur couleur/parité et 35× sur un numéro exact; le blackjack
+paie 1× sur une victoire classique et 1,5× pour un blackjack naturel. Une
+égalité au blackjack rembourse la mise.
 
 Les niveaux vont de 1 à 60. Le prochain niveau coûte 100 × niveau XP
 (par exemple 100 XP du niveau 1 au 2, puis 200 XP du niveau 2 au 3).

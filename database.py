@@ -221,6 +221,50 @@ class Database:
                 player["in_prison_until"] = 0
             return player
 
+    async def get_player_balance(
+        self, user_id: int, chat_id: int = 0
+    ) -> int | None:
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                "SELECT cash FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row is not None else None
+
+    async def settle_casino_bet(
+        self,
+        user_id: int,
+        chat_id: int,
+        stake: int,
+        net_change: int,
+    ) -> int | None:
+        """Apply a wager's net balance change if its stake is affordable."""
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                UPDATE players
+                SET cash = cash + ?
+                WHERE user_id = ? AND chat_id = ? AND cash >= ?
+                """,
+                (net_change, user_id, chat_id, stake),
+            )
+            if cursor.rowcount != 1:
+                await connection.rollback()
+                return None
+
+            cursor = await connection.execute(
+                "SELECT cash FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                return None
+            await connection.commit()
+            return int(row[0])
+
     async def get_top_players(
         self, limit: int = 10, chat_id: int = 0
     ) -> list[dict[str, Any]]:

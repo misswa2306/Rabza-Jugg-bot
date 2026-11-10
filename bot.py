@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 import time
-from typing import cast
+from typing import TypedDict, cast
 
 from telegram import (
     CallbackQuery,
@@ -48,6 +49,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class ActorInfo(TypedDict):
+    id: int
+    name: str
+    username: str | None
+
+
+ROULETTE_RED_NUMBERS = frozenset(
+    {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+)
+
+
 async def edit_callback_message(
     query: CallbackQuery,
     text: str,
@@ -69,7 +81,8 @@ def database_for(context: ContextTypes.DEFAULT_TYPE) -> Database:
 async def player_context(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> tuple[User | Chat, Chat, Message] | None:
+    actor_override: ActorInfo | None = None,
+) -> tuple[ActorInfo, Chat, Message] | None:
     """Resolve this message's actor and ensure its player account."""
     user = update.effective_user
     chat = update.effective_chat
@@ -77,26 +90,37 @@ async def player_context(
     if chat is None or message is None:
         return None
 
-    if user is not None:
+    if actor_override is not None:
+        actor_info = actor_override
+    elif user is not None:
         if user.is_bot:
             return None
-        actor: User | Chat = user
-        username = user.username
+        actor_info: ActorInfo = {
+            "id": user.id,
+            "name": user.full_name,
+            "username": user.username,
+        }
     else:
         sender_chat = message.sender_chat
         if sender_chat is None:
             return None
-        actor = sender_chat
-        username = sender_chat.title or "Admin Anonyme"
+        actor_info = {
+            "id": sender_chat.id,
+            "name": sender_chat.title or "Admin Anonyme",
+            "username": sender_chat.title or "Admin Anonyme",
+        }
 
-    await database_for(context).ensure_player(actor.id, username, chat.id)
-    return actor, chat, message
+    await database_for(context).ensure_player(
+        actor_info["id"], actor_info["username"], chat.id
+    )
+    return actor_info, chat, message
 
 
 def owned_callback_payload(
     data: str | None,
     namespace: str,
     user_id: int,
+    anonymous_chat_id: int | None = None,
 ) -> str | None:
     """Return a callback payload only for the player who opened its menu."""
     if data is None:
@@ -108,7 +132,37 @@ def owned_callback_payload(
         owner_id = int(parts[1])
     except ValueError:
         return None
-    return parts[2] if owner_id == user_id else None
+    return parts[2] if owner_id in {user_id, anonymous_chat_id} else None
+
+
+def callback_actor_info(
+    update: Update,
+    data: str | None,
+    namespace: str,
+) -> tuple[ActorInfo, str] | None:
+    """Resolve the player who owns a callback, including group-anonymous menus."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if chat is None:
+        return None
+
+    if user is not None:
+        payload = owned_callback_payload(data, namespace, user.id)
+        if payload is not None and not user.is_bot:
+            return (
+                {"id": user.id, "name": user.full_name, "username": user.username},
+                payload,
+            )
+
+    if chat.type in {"group", "supergroup"}:
+        payload = owned_callback_payload(data, namespace, chat.id)
+        if payload is not None:
+            title = chat.title or "Admin Anonyme"
+            return (
+                {"id": chat.id, "name": title, "username": title},
+                payload,
+            )
+    return None
 
 
 def prison_remaining_seconds(player: dict[str, object]) -> int:
@@ -131,6 +185,28 @@ def prison_remaining_seconds(player: dict[str, object]) -> int:
     if not isinstance(end_time, (int, float)):
         raise TypeError("in_prison_until doit être un timestamp Unix")
     return max(0, int(end_time - time.time()))
+
+
+def blackjack_hand_value(hand: list[str]) -> int:
+    value = sum(
+        11 if card == "A" else 10 if card in {"J", "Q", "K"} else int(card)
+        for card in hand
+    )
+    aces = hand.count("A")
+    while value > 21 and aces:
+        value -= 10
+        aces -= 1
+    return value
+
+
+def deal_blackjack() -> tuple[list[str], list[str]]:
+    deck = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"] * 4
+    random.shuffle(deck)
+    player_hand = [deck.pop(), deck.pop()]
+    dealer_hand = [deck.pop(), deck.pop()]
+    while blackjack_hand_value(dealer_hand) < 17:
+        dealer_hand.append(deck.pop())
+    return player_hand, dealer_hand
 
 
 async def post_init(application: Application) -> None:
@@ -156,17 +232,12 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    player_actor, chat, message = actor
-    display_name = (
-        player_actor.first_name
-        if isinstance(player_actor, User)
-        else player_actor.title or "Admin Anonyme"
-    )
+    actor_info, chat, message = actor
     database = database_for(context)
-    player = await database.get_player(player_actor.id, chat.id)
+    player = await database.get_player(actor_info["id"], chat.id)
     if player is None:
         raise RuntimeError(
-            f"Le joueur {player_actor.id} est introuvable après son enregistrement."
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
 
     remaining_seconds = prison_remaining_seconds(player)
@@ -178,7 +249,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "Libre"
 
     await message.reply_text(
-        f"📍 Profil de {display_name}\n"
+        f"📍 Profil de {actor_info['name']}\n"
         f"💵 Kob: {player['cash']}$\n"
         f"🚘 Gamos: {player['gamos']}\n"
         f"🔥 Heat: {player['heat']}/100\n"
@@ -193,13 +264,15 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, chat, message = actor
+    actor_info, chat, message = actor
 
     database = database_for(context)
-    player = await database.get_player(user.id, chat.id)
-    effects = await database.get_item_effects(user.id, chat.id)
+    player = await database.get_player(actor_info["id"], chat.id)
+    effects = await database.get_item_effects(actor_info["id"], chat.id)
     if player is None:
-        raise RuntimeError(f"Le joueur {user.id} est introuvable après son enregistrement.")
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
+        )
     jail_seconds = prison_remaining_seconds(player)
     if jail_seconds:
         await message.reply_text(
@@ -212,7 +285,7 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton(
                 spec.title,
-                callback_data=f"game:{user.id}:{action_id}",
+                callback_data=f"game:{actor_info['id']}:{action_id}",
             )
         ]
         for action_id, spec in available
@@ -227,7 +300,7 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             [
                 InlineKeyboardButton(
                     "🔒 Débloque d'autres moves: /profil et /shop",
-                    callback_data=f"game:{user.id}:locked",
+                    callback_data=f"game:{actor_info['id']}:locked",
                 )
             ]
         )
@@ -245,16 +318,14 @@ async def handle_game_action(
     if query is None:
         return
     await query.answer()
-    user = update.effective_user
-    if user is None:
+    callback_actor = callback_actor_info(update, query.data, "game")
+    if callback_actor is None:
         return
-    action = owned_callback_payload(query.data, "game", user.id)
-    if action is None:
-        return
-    actor = await player_context(update, context)
+    actor_info, action = callback_actor
+    actor = await player_context(update, context, actor_info)
     if actor is None:
         return
-    user, chat = actor[0], actor[1]
+    actor_info, chat = actor[0], actor[1]
 
     allowed_actions = set(ACTION_SPECS)
     if action not in allowed_actions:
@@ -262,10 +333,10 @@ async def handle_game_action(
         return
 
     database = database_for(context)
-    player = await database.get_player(user.id, chat.id)
-    effects = await database.get_item_effects(user.id, chat.id)
+    player = await database.get_player(actor_info["id"], chat.id)
+    effects = await database.get_item_effects(actor_info["id"], chat.id)
     if player is None:
-        raise RuntimeError(f"Le joueur {user.id} est introuvable.")
+        raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
     spec = ACTION_SPECS[action]
     jail_seconds = prison_remaining_seconds(player)
     if jail_seconds:
@@ -309,7 +380,7 @@ async def handle_game_action(
         else None
     )
     applied = await database.apply_action_result(
-        user.id,
+        actor_info["id"],
         result.cash_delta,
         result.heat_delta,
         result.gamos,
@@ -336,11 +407,11 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, message = actor[0], actor[2]
+    actor_info, message = actor[0], actor[2]
     keyboard = [
         [
             InlineKeyboardButton(
-                category.title(), callback_data=f"shop:{user.id}:{category}"
+                category.title(), callback_data=f"shop:{actor_info['id']}:{category}"
             )
         ]
         for category in SHOP_CATEGORIES
@@ -357,20 +428,19 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if query is None:
         return
     await query.answer()
-    user = update.effective_user
-    if user is None:
-        return
     data = query.data or ""
     if data.startswith("buy:"):
-        payload = owned_callback_payload(data, "buy", user.id)
+        namespace = "buy"
     else:
-        payload = owned_callback_payload(data, "shop", user.id)
-    if payload is None:
+        namespace = "shop"
+    callback_actor = callback_actor_info(update, data, namespace)
+    if callback_actor is None:
         return
-    actor = await player_context(update, context)
+    actor_info, payload = callback_actor
+    actor = await player_context(update, context, actor_info)
     if actor is None:
         return
-    user, chat = actor[0], actor[1]
+    actor_info, chat = actor[0], actor[1]
     database = database_for(context)
 
     if data.startswith("shop:") and payload != "home":
@@ -378,21 +448,26 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if category not in SHOP_CATEGORIES:
             await edit_callback_message(query, "Cette catégorie n'existe pas.")
             return
-        player = await database.get_player(user.id, chat.id)
+        player = await database.get_player(actor_info["id"], chat.id)
         if player is None:
-            raise RuntimeError(f"Le joueur {user.id} est introuvable.")
+            raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
         category_items = [item for item in ITEMS if item.category == category]
         keyboard = [
             [
                 InlineKeyboardButton(
                     f"{item.name} — {item.price}$ (niv. {item.min_level})",
-                    callback_data=f"buy:{user.id}:{item.item_id}",
+                    callback_data=f"buy:{actor_info['id']}:{item.item_id}",
                 )
             ]
             for item in category_items
         ]
         keyboard.append(
-            [InlineKeyboardButton("↩️ Catégories", callback_data=f"shop:{user.id}:home")]
+            [
+                InlineKeyboardButton(
+                    "↩️ Catégories",
+                    callback_data=f"shop:{actor_info['id']}:home",
+                )
+            ]
         )
         await edit_callback_message(
             query,
@@ -406,7 +481,8 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         keyboard = [
             [
                 InlineKeyboardButton(
-                    category.title(), callback_data=f"shop:{user.id}:{category}"
+                    category.title(),
+                    callback_data=f"shop:{actor_info['id']}:{category}",
                 )
             ]
             for category in SHOP_CATEGORIES
@@ -424,9 +500,9 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if item is None:
             await edit_callback_message(query, "Cet item n'existe pas.")
             return
-        outcome = await database.purchase_item(user.id, item_id, chat.id)
+        outcome = await database.purchase_item(actor_info["id"], item_id, chat.id)
         if outcome == "ok":
-            player = await database.get_player(user.id, chat.id)
+            player = await database.get_player(actor_info["id"], chat.id)
             text = (
                 f"✅ {item.name} ajouté à ton inventaire! "
                 f"Kob restant: {player['cash']}$."
@@ -445,13 +521,13 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     [
                         InlineKeyboardButton(
                             f"↩️ {SHOP_CATEGORIES[item.category]}",
-                            callback_data=f"shop:{user.id}:{item.category}",
+                            callback_data=f"shop:{actor_info['id']}:{item.category}",
                         )
                     ],
                     [
                         InlineKeyboardButton(
                             "Toutes les catégories",
-                            callback_data=f"shop:{user.id}:home",
+                            callback_data=f"shop:{actor_info['id']}:home",
                         )
                     ],
                 ]
@@ -466,9 +542,9 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, chat, message = actor
+    actor_info, chat, message = actor
     database = database_for(context)
-    items = await database.get_inventory(user.id, chat.id)
+    items = await database.get_inventory(actor_info["id"], chat.id)
     if not items:
         await message.reply_text("Ton inventaire est vide. Fais /shop pour magasiner.")
         return
@@ -483,7 +559,7 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"\n{SHOP_CATEGORIES.get(category, category.title())}:")
         lines.extend(entries)
 
-    effects = await database.get_item_effects(user.id, chat.id)
+    effects = await database.get_item_effects(actor_info["id"], chat.id)
     lines.append(f"\nBonus XP max des sapes: +{effects['xp_bonus']}%")
     lines.append(f"Bonus de réussite abstrait: +{effects['success_bonus']:.0%}")
     lines.append(
@@ -497,16 +573,16 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, chat, message = actor
+    actor_info, chat, message = actor
     if chat.type not in {"group", "supergroup"}:
         await message.reply_text(
             "❌ Les braquages entre joueurs se font uniquement dans les groupes !"
         )
         return
     database = database_for(context)
-    attacker = await database.get_player(user.id, chat.id)
+    attacker = await database.get_player(actor_info["id"], chat.id)
     if attacker is None:
-        raise RuntimeError(f"Le joueur {user.id} est introuvable.")
+        raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
     jail_seconds = prison_remaining_seconds(attacker)
     if jail_seconds:
         await message.reply_text(
@@ -527,11 +603,11 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Joueur introuvable. Il doit avoir lancé /start et avoir un username Telegram."
         )
         return
-    if victim["user_id"] == user.id:
+    if victim["user_id"] == actor_info["id"]:
         await message.reply_text("Tu peux pas lancer un défi contre toi-même.")
         return
 
-    attacker_effects = await database.get_item_effects(user.id, chat.id)
+    attacker_effects = await database.get_item_effects(actor_info["id"], chat.id)
     victim_effects = await database.get_item_effects(victim["user_id"], chat.id)
     result = resolve_pvp(
         attacker_has_weapon=bool(attacker_effects["has_weapon"]),
@@ -543,7 +619,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else None
     )
     applied = await database.apply_pvp_result(
-        user.id,
+        actor_info["id"],
         victim["user_id"],
         result.outcome,
         result.fine,
@@ -600,12 +676,12 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, chat, message = actor
+    actor_info, chat, message = actor
     database = database_for(context)
-    player = await database.get_player(user.id, chat.id)
+    player = await database.get_player(actor_info["id"], chat.id)
     if player is None:
         raise RuntimeError(
-            f"Le joueur {user.id} est introuvable après son enregistrement."
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
     prison_until = player["in_prison_until"]
     remaining_seconds = prison_remaining_seconds(player)
@@ -623,7 +699,7 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton(
                 f"Payer la caution ({BAIL_COST}$)",
-                callback_data=f"bail:{user.id}:pay",
+                callback_data=f"bail:{actor_info['id']}:pay",
             )
         ]
     ]
@@ -635,20 +711,175 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    actor = await player_context(update, context)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    args = context.args
+    if not args:
+        await message.reply_text(
+            "🎰 Casino de Montréal — jeux fictifs\n\n"
+            "Jeux disponibles:\n"
+            "• Blackjack: /casino blackjack <mise>\n"
+            "• Roulette: /casino roulette <rouge|noir|pair|impair|0-36> <mise>\n\n"
+            "La mise doit être un entier positif et ne peut pas dépasser ton solde. "
+            "Une victoire couleur/parité ou au blackjack rapporte la mise en gain "
+            "net (la mise est également rendue). Un numéro exact rapporte 35× la "
+            "mise en gain net. Une égalité au blackjack rembourse la mise."
+        )
+        return
+
+    game_name = args[0].casefold()
+    if game_name == "blackjack":
+        if len(args) != 2:
+            await message.reply_text("Usage: /casino blackjack <mise>")
+            return
+        choice = ""
+        stake_text = args[1]
+    elif game_name == "roulette":
+        if len(args) != 3:
+            await message.reply_text(
+                "Usage: /casino roulette <rouge|noir|pair|impair|0-36> <mise>"
+            )
+            return
+        choice = args[1].casefold()
+        stake_text = args[2]
+        if choice not in {"rouge", "noir", "pair", "impair"}:
+            try:
+                number = int(choice)
+            except ValueError:
+                await message.reply_text(
+                    "Choix invalide. Mise sur rouge, noir, pair, impair ou un "
+                    "nombre de 0 à 36."
+                )
+                return
+            if not 0 <= number <= 36:
+                await message.reply_text("Le numéro doit être compris entre 0 et 36.")
+                return
+            choice = str(number)
+    else:
+        await message.reply_text(
+            "Jeu inconnu. Choisis blackjack ou roulette avec /casino."
+        )
+        return
+
+    if not stake_text.isdecimal():
+        await message.reply_text("La mise doit être un entier positif, par exemple 500.")
+        return
+    stake = int(stake_text)
+    if stake <= 0:
+        await message.reply_text("La mise doit être supérieure à 0$.")
+        return
+
+    database = database_for(context)
+    balance = await database.get_player_balance(actor_info["id"], chat.id)
+    if balance is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
+        )
+    if stake > balance:
+        await message.reply_text(
+            f"{actor_info['name']}, ta mise ({stake}$) dépasse ton solde "
+            f"({balance}$)."
+        )
+        return
+
+    net_change = -stake
+    if game_name == "blackjack":
+        player_hand, dealer_hand = deal_blackjack()
+        player_total = blackjack_hand_value(player_hand)
+        dealer_total = blackjack_hand_value(dealer_hand)
+        player_blackjack = len(player_hand) == 2 and player_total == 21
+        dealer_blackjack = len(dealer_hand) == 2 and dealer_total == 21
+        if player_blackjack and not dealer_blackjack:
+            net_change = stake * 3 // 2
+            outcome = f"Blackjack! Tu gagnes {net_change}$ net."
+        elif dealer_blackjack and not player_blackjack:
+            outcome = "Le croupier a un blackjack. Tu perds ta mise."
+        elif player_total > 21:
+            outcome = "Tu dépasses 21. Tu perds ta mise."
+        elif dealer_total > 21 or player_total > dealer_total:
+            net_change = stake
+            outcome = f"Tu remportes la manche: +{net_change}$ net."
+        elif player_total == dealer_total:
+            net_change = 0
+            outcome = "Égalité: ta mise est remboursée."
+        else:
+            outcome = "Le croupier gagne. Tu perds ta mise."
+
+        result_text = (
+            f"🃏 Blackjack pour {actor_info['name']}\n"
+            f"Tes cartes: {', '.join(player_hand)} ({player_total})\n"
+            f"Croupier: {', '.join(dealer_hand)} ({dealer_total})\n"
+            f"Mise: {stake}$\n{outcome}"
+        )
+    else:
+        result_number = random.randint(0, 36)
+        if result_number == 0:
+            result_color = "vert"
+        elif result_number in ROULETTE_RED_NUMBERS:
+            result_color = "rouge"
+        else:
+            result_color = "noir"
+
+        if choice in {"rouge", "noir"}:
+            won = result_number != 0 and choice == result_color
+            multiplier = 1
+        elif choice in {"pair", "impair"}:
+            won = result_number != 0 and (
+                "pair" if result_number % 2 == 0 else "impair"
+            ) == choice
+            multiplier = 1
+        else:
+            won = result_number == int(choice)
+            multiplier = 35
+
+        if won:
+            net_change = stake * multiplier
+            outcome = f"Tu gagnes {net_change}$ net!"
+        else:
+            outcome = "La bille n'est pas tombée sur ton choix: tu perds ta mise."
+        result_text = (
+            f"🎰 Roulette pour {actor_info['name']}\n"
+            f"Résultat: {result_number} ({result_color})\n"
+            f"Ton choix: {choice}\n"
+            f"Mise: {stake}$\n{outcome}"
+        )
+
+    new_balance = await database.settle_casino_bet(
+        actor_info["id"], chat.id, stake, net_change
+    )
+    if new_balance is None:
+        current_balance = await database.get_player_balance(actor_info["id"], chat.id)
+        if current_balance is None:
+            raise RuntimeError(
+                f"Le joueur {actor_info['id']} a disparu pendant le règlement du pari."
+            )
+        await message.reply_text(
+            f"Solde insuffisant au moment du règlement: {current_balance}$ "
+            f"disponibles pour une mise de {stake}$."
+        )
+        return
+
+    await message.reply_text(f"{result_text}\n💵 Nouveau solde: {new_balance}$.")
+
+
 async def pay_bail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
     await query.answer()
-    user = update.effective_user
-    if user is None or owned_callback_payload(query.data, "bail", user.id) != "pay":
+    callback_actor = callback_actor_info(update, query.data, "bail")
+    if callback_actor is None or callback_actor[1] != "pay":
         return
-    actor = await player_context(update, context)
+    actor_info = callback_actor[0]
+    actor = await player_context(update, context, actor_info)
     if actor is None:
         return
-    user, chat = actor[0], actor[1]
+    actor_info, chat = actor[0], actor[1]
     released = await database_for(context).pay_bail(
-        user.id, BAIL_COST, chat.id
+        actor_info["id"], BAIL_COST, chat.id
     )
     if released:
         await edit_callback_message(
@@ -693,6 +924,7 @@ def main() -> None:
     application.add_handler(CommandHandler("braquer", braquer))
     application.add_handler(CommandHandler("top", top))
     application.add_handler(CommandHandler("prison", prison))
+    application.add_handler(CommandHandler("casino", casino))
     application.add_handler(
         CallbackQueryHandler(
             handle_game_action,

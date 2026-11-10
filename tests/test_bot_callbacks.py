@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, patch
 from telegram.error import BadRequest
 
 from bot import (
+    blackjack_hand_value,
     braquer,
+    casino,
     edit_callback_message,
     handle_game_action,
     player_context,
@@ -50,8 +52,12 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
             )
             chat = SimpleNamespace(id=-100123)
             message = object()
-            first_user = SimpleNamespace(id=101, username="first", is_bot=False)
-            second_user = SimpleNamespace(id=202, username="second", is_bot=False)
+            first_user = SimpleNamespace(
+                id=101, username="first", full_name="First", is_bot=False
+            )
+            second_user = SimpleNamespace(
+                id=202, username="second", full_name="Second", is_bot=False
+            )
 
             first = await player_context(
                 SimpleNamespace(
@@ -70,11 +76,11 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
                 context,
             )
 
-            self.assertEqual(first[0].id, 101)
-            self.assertEqual(second[0].id, 202)
+            self.assertEqual(first[0]["id"], 101)
+            self.assertEqual(second[0]["id"], 202)
             self.assertEqual(first[1].id, second[1].id)
-            first_player = await database.get_player(first[0].id, chat.id)
-            second_player = await database.get_player(second[0].id, chat.id)
+            first_player = await database.get_player(first[0]["id"], chat.id)
+            second_player = await database.get_player(second[0]["id"], chat.id)
             self.assertEqual(first_player["user_id"], 101)
             self.assertEqual(second_player["user_id"], 202)
             self.assertNotEqual(first_player["user_id"], second_player["user_id"])
@@ -85,7 +91,9 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
         )
         missing_chat = await player_context(
             SimpleNamespace(
-                effective_user=SimpleNamespace(id=1, username="user", is_bot=False),
+                effective_user=SimpleNamespace(
+                    id=1, username="user", full_name="User", is_bot=False
+                ),
                 effective_chat=None,
                 effective_message=object(),
             ),
@@ -93,7 +101,9 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
         )
         bot_user = await player_context(
             SimpleNamespace(
-                effective_user=SimpleNamespace(id=2, username="bot", is_bot=True),
+                effective_user=SimpleNamespace(
+                    id=2, username="bot", full_name="Bot", is_bot=True
+                ),
                 effective_chat=SimpleNamespace(id=-1),
                 effective_message=object(),
             ),
@@ -162,6 +172,134 @@ class PrisonTimerTests(unittest.TestCase):
             )
 
 
+class CasinoTests(unittest.IsolatedAsyncioTestCase):
+    async def _create_context(self, chat_id: int = -100456):
+        temp_dir = TemporaryDirectory()
+        database = Database(str(Path(temp_dir.name) / "casino.sqlite3"))
+        await database.initialize()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=[],
+        )
+        return temp_dir, database, context, chat_id
+
+    async def test_casino_menu_is_displayed_without_arguments(self) -> None:
+        temp_dir, _, context, chat_id = await self._create_context()
+        self.addCleanup(temp_dir.cleanup)
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=123, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            effective_message=message,
+        )
+
+        await casino(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("/casino blackjack <mise>", text)
+        self.assertIn("/casino roulette", text)
+
+    async def test_anonymous_admin_can_play_roulette_with_negative_database_id(
+        self,
+    ) -> None:
+        temp_dir, database, context, chat_id = await self._create_context()
+        self.addCleanup(temp_dir.cleanup)
+        context.args = ["roulette", "rouge", "100"]
+        message = SimpleNamespace(
+            reply_text=AsyncMock(),
+            sender_chat=SimpleNamespace(id=chat_id, title="Admin de Montréal"),
+        )
+        update = SimpleNamespace(
+            effective_user=None,
+            effective_chat=SimpleNamespace(
+                id=chat_id, title="Admin de Montréal", type="supergroup"
+            ),
+            effective_message=message,
+        )
+
+        with patch("bot.random.randint", return_value=1):
+            await casino(update, context)
+
+        self.assertEqual(await database.get_player_balance(chat_id, chat_id), 600)
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("Roulette pour Admin de Montréal", text)
+        self.assertIn("Nouveau solde: 600$", text)
+
+    async def test_blackjack_natural_pays_one_and_a_half_times_the_stake(
+        self,
+    ) -> None:
+        temp_dir, database, context, chat_id = await self._create_context()
+        self.addCleanup(temp_dir.cleanup)
+        context.args = ["blackjack", "101"]
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=44, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            effective_message=message,
+        )
+
+        with patch("bot.deal_blackjack", return_value=(["A", "K"], ["9", "7"])):
+            await casino(update, context)
+
+        self.assertEqual(await database.get_player_balance(44, chat_id), 651)
+        self.assertIn(
+            "Blackjack! Tu gagnes 151$ net",
+            message.reply_text.await_args.args[0],
+        )
+
+    async def test_exact_roulette_number_pays_thirty_five_times_the_stake(self) -> None:
+        temp_dir, database, context, chat_id = await self._create_context()
+        self.addCleanup(temp_dir.cleanup)
+        context.args = ["roulette", "17", "20"]
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=66, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            effective_message=message,
+        )
+
+        with patch("bot.random.randint", return_value=17):
+            await casino(update, context)
+
+        self.assertEqual(await database.get_player_balance(66, chat_id), 1200)
+        self.assertIn("Tu gagnes 700$ net", message.reply_text.await_args.args[0])
+
+    async def test_casino_rejects_insufficient_and_invalid_bets(self) -> None:
+        temp_dir, database, context, chat_id = await self._create_context()
+        self.addCleanup(temp_dir.cleanup)
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=55, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            effective_message=message,
+        )
+
+        context.args = ["blackjack", "501"]
+        await casino(update, context)
+        self.assertIn("dépasse ton solde", message.reply_text.await_args.args[0])
+        self.assertEqual(await database.get_player_balance(55, chat_id), 500)
+
+        message.reply_text.reset_mock()
+        context.args = ["roulette", "vert", "100"]
+        await casino(update, context)
+        self.assertIn("Choix invalide", message.reply_text.await_args.args[0])
+        self.assertEqual(await database.get_player_balance(55, chat_id), 500)
+
+
+class BlackjackHandTests(unittest.TestCase):
+    def test_ace_counts_as_eleven_or_one_to_avoid_busting(self) -> None:
+        self.assertEqual(blackjack_hand_value(["A", "K"]), 21)
+        self.assertEqual(blackjack_hand_value(["A", "9", "5"]), 15)
+
+
 class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
     async def _invoke_braquer(self, chat_type: str) -> tuple[AsyncMock, AsyncMock]:
         database = AsyncMock()
@@ -178,7 +316,7 @@ class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(reply_text=AsyncMock())
         update = SimpleNamespace(
             effective_user=SimpleNamespace(
-                id=101, username="joueur", is_bot=False
+                id=101, username="joueur", full_name="Joueur", is_bot=False
             ),
             effective_chat=SimpleNamespace(id=-1001, type=chat_type),
             effective_message=message,
@@ -205,6 +343,48 @@ class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anonymous_owner_callback_uses_group_id(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {
+            "user_id": -100303,
+            "username": "Groupe Montréal",
+            "level": 1,
+            "in_prison_until": 0,
+        }
+        database.get_item_effects.return_value = {
+            "has_obd": False,
+            "success_bonus": 0.0,
+            "xp_bonus": 0,
+        }
+        database.apply_action_result.return_value = True
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="game:-100303:bixi")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=303, username="clicker", full_name="Clicker", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(
+                id=-100303, title="Groupe Montréal", type="supergroup"
+            ),
+            effective_message=object(),
+        )
+
+        with (
+            patch("bot.asyncio.sleep", new_callable=AsyncMock),
+            patch("game.random.random", return_value=0.1),
+        ):
+            await handle_game_action(update, context)
+
+        database.ensure_player.assert_awaited_once_with(
+            -100303, "Groupe Montréal", -100303
+        )
+        database.apply_action_result.assert_awaited_once_with(
+            -100303, 90, 8, None, None, 30, chat_id=-100303
+        )
+
     async def test_callback_passes_equipment_bonus_to_random_resolver(self) -> None:
         database = AsyncMock()
         database.get_player.return_value = {
@@ -226,7 +406,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(
             callback_query=query,
             effective_user=SimpleNamespace(
-                id=303, username="jugg_player", is_bot=False
+                id=303, username="jugg_player", full_name="Jugg Player", is_bot=False
             ),
             effective_chat=SimpleNamespace(id=-100303, type="supergroup"),
             effective_message=object(),
