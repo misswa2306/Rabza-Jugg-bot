@@ -69,16 +69,28 @@ def database_for(context: ContextTypes.DEFAULT_TYPE) -> Database:
 async def player_context(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> tuple[User, Chat, Message] | None:
-    """Resolve this group/private-chat actor and ensure their user-id account."""
+) -> tuple[User | Chat, Chat, Message] | None:
+    """Resolve this message's actor and ensure its player account."""
     user = update.effective_user
     chat = update.effective_chat
     message = update.effective_message
-    if user is None or chat is None or message is None or user.is_bot:
+    if chat is None or message is None:
         return None
 
-    await database_for(context).ensure_player(user.id, user.username, chat.id)
-    return user, chat, message
+    if user is not None:
+        if user.is_bot:
+            return None
+        actor: User | Chat = user
+        username = user.username
+    else:
+        sender_chat = message.sender_chat
+        if sender_chat is None:
+            return None
+        actor = sender_chat
+        username = sender_chat.title or "Admin Anonyme"
+
+    await database_for(context).ensure_player(actor.id, username, chat.id)
+    return actor, chat, message
 
 
 def owned_callback_payload(
@@ -144,12 +156,17 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    user, chat, message = actor
+    player_actor, chat, message = actor
+    display_name = (
+        player_actor.first_name
+        if isinstance(player_actor, User)
+        else player_actor.title or "Admin Anonyme"
+    )
     database = database_for(context)
-    player = await database.get_player(user.id, chat.id)
+    player = await database.get_player(player_actor.id, chat.id)
     if player is None:
         raise RuntimeError(
-            f"Le joueur {user.id} est introuvable après son enregistrement."
+            f"Le joueur {player_actor.id} est introuvable après son enregistrement."
         )
 
     remaining_seconds = prison_remaining_seconds(player)
@@ -161,7 +178,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "Libre"
 
     await message.reply_text(
-        f"📍 Profil de {user.first_name}\n"
+        f"📍 Profil de {display_name}\n"
         f"💵 Kob: {player['cash']}$\n"
         f"🚘 Gamos: {player['gamos']}\n"
         f"🔥 Heat: {player['heat']}/100\n"

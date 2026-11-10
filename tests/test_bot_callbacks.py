@@ -11,6 +11,7 @@ from bot import (
     edit_callback_message,
     handle_game_action,
     player_context,
+    profil,
     prison_remaining_seconds,
 )
 from config import validate_config
@@ -100,6 +101,38 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(missing_chat)
         self.assertIsNone(bot_user)
+
+    async def test_anonymous_admin_uses_sender_chat_id_and_title(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "anonymous-admin.sqlite3"))
+            await database.initialize()
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"database": database})
+            )
+            sender_chat = SimpleNamespace(
+                id=-100456,
+                title="Admins de Montréal",
+            )
+            message = SimpleNamespace(
+                sender_chat=sender_chat,
+                reply_text=AsyncMock(),
+            )
+            update = SimpleNamespace(
+                effective_user=None,
+                effective_chat=SimpleNamespace(id=-100456),
+                effective_message=message,
+            )
+
+            await profil(update, context)
+
+            player = await database.get_player(sender_chat.id, -100456)
+            self.assertEqual(player["user_id"], sender_chat.id)
+            self.assertEqual(player["username"], sender_chat.title)
+            message.reply_text.assert_awaited_once()
+            self.assertIn(
+                "Profil de Admins de Montréal",
+                message.reply_text.await_args.args[0],
+            )
 
 
 class PrisonTimerTests(unittest.TestCase):
